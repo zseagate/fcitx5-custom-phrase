@@ -7,11 +7,16 @@
 不需要 fcitx5 正在运行；测试使用临时 HOME，不会碰你的真实词库。
 """
 
+import json
 import os
+import socket
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
+import urllib.error
+import urllib.request
 from pathlib import Path
 from unittest import mock
 
@@ -171,6 +176,126 @@ class IntegrationTests(unittest.TestCase):
         self.assertEqual(cp.returncode, 0, cp.stderr)
         self.assertIn("腾讯微信 teng'xun'wei'xin 150",
                       self.cli("dump", "pinyin").stdout)
+
+
+class WebTests(unittest.TestCase):
+    """启动真实 HTTP 服务，验证 CSRF、增删、导入导出与退出。"""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.tmp = tempfile.TemporaryDirectory()
+        cls.home = Path(cls.tmp.name) / "home"
+        cls.home.mkdir()
+        with socket.socket() as s:
+            s.bind(("127.0.0.1", 0))
+            cls.port = s.getsockname()[1]
+        cls.base = f"http://127.0.0.1:{cls.port}"
+        cls.env = os.environ.copy()
+        cls.env.update({
+            "HOME": str(cls.home),
+            "XDG_CACHE_HOME": str(Path(cls.tmp.name) / "cache"),
+            "FCITX5_PHRASE_NO_PROCESS": "1",
+        })
+        cls.proc = subprocess.Popen(
+            [sys.executable, str(REPO / "fcitx5-phrase"), "web",
+             "--port", str(cls.port), "--token", "testtoken", "--no-open"],
+            env=cls.env, stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        for _ in range(80):
+            try:
+                urllib.request.urlopen(cls.base + "/", timeout=0.5).read()
+                break
+            except Exception:
+                time.sleep(0.1)
+        else:
+            raise RuntimeError("Web 服务未能启动")
+
+    @classmethod
+    def tearDownClass(cls):
+        try:
+            cls.proc.terminate()
+            cls.proc.wait(timeout=5)
+        except Exception:
+            cls.proc.kill()
+        cls.tmp.cleanup()
+
+    def make_request(self, path, method="GET", data=None, token="testtoken",
+                     host=None):
+        headers = {}
+        if token:
+            headers["X-CSRF-Token"] = token
+        if host:
+            headers["Host"] = host
+        body = None
+        if data is not None:
+            body = json.dumps(data).encode()
+            headers["Content-Type"] = "application/json"
+        return urllib.request.Request(self.base + path, data=body,
+                                      headers=headers, method=method)
+
+    def request(self, path, method="GET", data=None, token="testtoken",
+                host=None):
+        return urllib.request.urlopen(
+            self.make_request(path, method, data, token, host), timeout=10)
+
+    def expect_403(self, req):
+        with self.assertRaises(urllib.error.HTTPError) as cm:
+            urllib.request.urlopen(req, timeout=5)
+        self.assertEqual(cm.exception.code, 403)
+        cm.exception.close()
+
+    def test_csrf_and_host_checks(self):
+        self.expect_403(urllib.request.Request(self.base + "/api/state"))
+        self.expect_403(self.make_request("/api/state", token="wrong"))
+        # Host 头校验（DNS rebinding 防护）
+        self.expect_403(self.make_request("/", host="evil.example"))
+
+    def test_add_remove_import_export(self):
+        r = self.request("/api/add", "POST", {
+            "phrase": "微信", "pinyin": "weixin", "wubi": "",
+            "weight": 100, "apply": True,
+        })
+        entry = json.loads(r.read())["entry"]
+        self.assertEqual(entry["pinyin"], "wei'xin")
+        self.assertEqual(entry["wubi"], "tmwy")
+
+        r = self.request("/api/import", "POST", {
+            "text": "开源\tkaiyuan\n社区,shequ,,130",
+            "replace": False, "apply": True,
+        })
+        self.assertEqual(json.loads(r.read())["imported"], 2)
+
+        state = json.loads(self.request("/api/state").read())
+        phrases = [e["phrase"] for e in state["entries"]]
+        self.assertEqual(phrases, ["微信", "开源", "社区"])
+
+        tsv = self.request("/api/export").read().decode()
+        self.assertIn("微信\twei'xin\ttmwy\t100", tsv)
+
+        r = self.request("/api/remove", "POST",
+                         {"phrase": "微信", "apply": True})
+        self.assertEqual(json.loads(r.read())["total"], 2)
+
+        # 删除后二进制词库也要同步
+        pinyin = self._dump("pinyin")
+        self.assertNotIn("微信", pinyin)
+
+    def _dump(self, target):
+        cp = subprocess.run(
+            [sys.executable, str(REPO / "fcitx5-phrase"), "dump", target],
+            env=self.env, text=True, capture_output=True,
+        )
+        return cp.stdout
+
+    def test_zz_shutdown(self):
+        r = self.request("/api/shutdown", "POST", {})
+        self.assertEqual(json.loads(r.read())["ok"], True)
+        for _ in range(50):
+            if self.proc.poll() is not None:
+                break
+            time.sleep(0.1)
+        self.assertIsNotNone(self.proc.poll())
 
 
 if __name__ == "__main__":

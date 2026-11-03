@@ -32,7 +32,7 @@ from collections import Counter, defaultdict
 from datetime import datetime
 from pathlib import Path
 
-VERSION = "2.0.0"
+VERSION = "2.1.0"
 
 CJK_RE = re.compile(r"[\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff]")
 PINYIN_RE = re.compile(r"^[a-zü:']+$")
@@ -835,42 +835,139 @@ def apply_entries(entries: list[dict], *, remove_phrases: set[str] | None = None
 
 
 # ---------------------------------------------------------------------------
+# 可复用的操作（CLI 与 Web 共用）
+# ---------------------------------------------------------------------------
+
+_INDEX_MEMORY: tuple[dict, dict] | None = None
+
+
+def get_indexes() -> tuple[dict, dict]:
+    """进程内缓存索引；Web 服务长期运行时不必每次重读码表。"""
+    global _INDEX_MEMORY
+    if _INDEX_MEMORY is None:
+        _INDEX_MEMORY = build_indexes()
+    return _INDEX_MEMORY
+
+
+def perform_add(phrase: str, pinyin: str | None, wubi: str | None,
+                weight: int, *, apply: bool) -> tuple[dict, int]:
+    pinyin_index, wubi_index = get_indexes()
+    entry = resolve_entry(phrase, pinyin, wubi, weight,
+                          pinyin_index, wubi_index)
+    entries = read_phrase_file()
+    upsert(entries, entry)
+    write_phrase_file(entries)
+    if apply:
+        apply_entries(entries, verbose=False)
+    return entry, len(entries)
+
+
+def perform_remove(phrase: str, *, apply: bool) -> int:
+    entries = read_phrase_file()
+    phrase = validate_phrase(phrase)
+    kept = [e for e in entries if e["phrase"] != phrase]
+    if len(kept) == len(entries):
+        raise PhraseError(f"词组表里没有: {phrase}")
+    write_phrase_file(kept)
+    if apply:
+        apply_entries(kept, remove_phrases={phrase}, verbose=False)
+    return len(kept)
+
+
+def parse_import_text(text: str, *, delimiter: str | None = None) -> list[dict]:
+    pinyin_index, wubi_index = get_indexes()
+    imported: list[dict] = []
+    for lineno, raw in enumerate(text.splitlines(), 1):
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        if delimiter:
+            parts = [p.strip() for p in raw.split(delimiter)]
+        elif "\t" in raw:
+            parts = [p.strip() for p in raw.split("\t")]
+        elif "," in raw:
+            parts = [p.strip() for p in raw.split(",")]
+        else:
+            parts = raw.split()
+        while len(parts) < 4:
+            parts.append("")
+        try:
+            e = resolve_entry(parts[0], parts[1] or None, parts[2] or None,
+                              int(parts[3]) if parts[3] else 100,
+                              pinyin_index, wubi_index)
+        except PhraseError as exc:
+            raise PhraseError(f"第 {lineno} 行: {exc}")
+        imported.append(e)
+    return imported
+
+
+def perform_import(text: str, *, replace: bool = False,
+                   delimiter: str | None = None,
+                   apply: bool) -> tuple[int, int]:
+    imported = parse_import_text(text, delimiter=delimiter)
+    if not imported:
+        raise PhraseError("没有可导入的词条")
+    entries = [] if replace else read_phrase_file()
+    for e in imported:
+        upsert(entries, e)
+    write_phrase_file(entries)
+    if apply:
+        apply_entries(entries, verbose=False)
+    return len(imported), len(entries)
+
+
+def export_text() -> str:
+    entries = read_phrase_file()
+    lines = [
+        "# fcitx5-custom-phrase 词组表",
+        "# 格式: 词组<TAB>拼音<TAB>五笔编码<TAB>权重",
+    ]
+    lines += [
+        "\t".join([e["phrase"], e["pinyin"], e["wubi"], str(e["weight"])])
+        for e in entries
+    ]
+    return "\n".join(lines) + ("\n" if entries else "")
+
+
+def state_info() -> dict:
+    entries = read_phrase_file()
+    return {
+        "version": VERSION,
+        "entries": entries,
+        "count": len(entries),
+        "fcitx_running": fcitx_running(),
+        "config_path": str(config_path()),
+        "pinyin_dict": str(pinyin_dict_path()),
+        "wbpy_dict": str(wbpy_dict_path()),
+        "main_dict": str(main_dict_path()),
+    }
+
+
+# ---------------------------------------------------------------------------
 # 命令
 # ---------------------------------------------------------------------------
 
 def cmd_add(args: argparse.Namespace) -> int:
-    pinyin_index, wubi_index = build_indexes()
-    entry = resolve_entry(
+    entry, total = perform_add(
         args.phrase, args.pinyin, args.wubi, args.weight,
-        pinyin_index, wubi_index,
+        apply=not args.no_apply,
     )
-    entries = read_phrase_file()
-    upsert(entries, entry)
-    write_phrase_file(entries)
     print(f"已写入词组表: {entry['phrase']}  "
           f"拼音={entry['pinyin']}  五笔={entry['wubi'] or '(无)'}  "
           f"权重={entry['weight']}")
     if args.no_apply:
         print("未应用。运行 `fcitx5-phrase apply` 使其生效。")
-        return 0
-    apply_entries(entries)
-    print("完成，输入编码即可看到新词组。")
+    else:
+        print("完成，输入编码即可看到新词组。")
     return 0
 
 
 def cmd_remove(args: argparse.Namespace) -> int:
-    entries = read_phrase_file()
-    phrase = validate_phrase(args.phrase)
-    kept = [e for e in entries if e["phrase"] != phrase]
-    if len(kept) == len(entries):
-        raise PhraseError(f"词组表里没有: {phrase}")
-    write_phrase_file(kept)
-    print(f"已从词组表移除: {phrase}")
+    total = perform_remove(args.phrase, apply=not args.no_apply)
+    print(f"已从词组表移除: {args.phrase}")
     if args.no_apply:
         print("未应用。运行 `fcitx5-phrase apply` 使其生效。")
-        return 0
-    apply_entries(kept, remove_phrases={phrase})
-    if not kept:
+    elif total == 0:
         print("词组表已空。")
     return 0
 
@@ -905,54 +1002,22 @@ def cmd_import(args: argparse.Namespace) -> int:
     src = Path(args.file).expanduser()
     if not src.exists():
         raise PhraseError(f"文件不存在: {src}")
-    pinyin_index, wubi_index = build_indexes()
-    imported: list[dict] = []
-    for lineno, raw in enumerate(src.read_text(encoding="utf-8").splitlines(), 1):
-        line = raw.strip()
-        if not line or line.startswith("#"):
-            continue
-        if args.delimiter:
-            parts = [p.strip() for p in raw.split(args.delimiter)]
-        elif "\t" in raw:
-            parts = [p.strip() for p in raw.split("\t")]
-        elif "," in raw:
-            parts = [p.strip() for p in raw.split(",")]
-        else:
-            parts = raw.split()
-        while len(parts) < 4:
-            parts.append("")
-        try:
-            e = resolve_entry(parts[0], parts[1] or None, parts[2] or None,
-                              int(parts[3]) if parts[3] else 100,
-                              pinyin_index, wubi_index)
-        except PhraseError as exc:
-            raise PhraseError(f"{src}:{lineno}: {exc}")
-        imported.append(e)
-    if not imported:
-        raise PhraseError("没有可导入的词条")
-    entries = [] if args.replace else read_phrase_file()
-    for e in imported:
-        upsert(entries, e)
-    write_phrase_file(entries)
-    print(f"已导入 {len(imported)} 条，词组表共 {len(entries)} 条。")
+    imported, total = perform_import(
+        src.read_text(encoding="utf-8"),
+        replace=args.replace, delimiter=args.delimiter,
+        apply=not args.no_apply,
+    )
+    print(f"已导入 {imported} 条，词组表共 {total} 条。")
     if args.no_apply:
         print("未应用。运行 `fcitx5-phrase apply` 使其生效。")
-        return 0
-    apply_entries(entries)
     return 0
 
 
 def cmd_export(args: argparse.Namespace) -> int:
-    entries = read_phrase_file()
-    text = "\n".join([
-        "# fcitx5-custom-phrase 词组表",
-        "# 格式: 词组<TAB>拼音<TAB>五笔编码<TAB>权重",
-        *("\t".join([e["phrase"], e["pinyin"], e["wubi"],
-                     str(e["weight"])]) for e in entries),
-    ]) + ("\n" if entries else "")
+    text = export_text()
     if args.file:
         Path(args.file).expanduser().write_text(text, encoding="utf-8")
-        print(f"已导出 {len(entries)} 条到 {args.file}")
+        print(f"已导出 {len(read_phrase_file())} 条到 {args.file}")
     else:
         sys.stdout.write(text)
     return 0
@@ -1002,6 +1067,12 @@ def cmd_restore(args: argparse.Namespace) -> int:
         if was_running:
             start_fcitx()
     return 0
+
+
+def cmd_web(args: argparse.Namespace) -> int:
+    from fcitx5_phrase_web import run_web
+    return run_web(host=args.host, port=args.port, token=args.token,
+                   open_browser=args.open_browser)
 
 
 def cmd_doctor(args: argparse.Namespace) -> int:
@@ -1097,6 +1168,17 @@ def build_parser() -> argparse.ArgumentParser:
                    choices=["all", "pinyin", "wbpy"])
     p.add_argument("--list", action="store_true", help="只列出备份")
     p.set_defaults(func=cmd_restore)
+
+    p = sub.add_parser("web", help="启动图形化 Web 管理界面")
+    p.add_argument("--host", default="127.0.0.1",
+                   help="监听地址，默认仅本机 127.0.0.1")
+    p.add_argument("--port", type=int, default=8765, help="端口，默认 8765")
+    p.add_argument("--token", default=None, help="固定 CSRF token（测试用）")
+    p.add_argument("--open", dest="open_browser", action="store_true",
+                   default=True, help="自动打开浏览器（默认）")
+    p.add_argument("--no-open", dest="open_browser", action="store_false",
+                   help="不自动打开浏览器")
+    p.set_defaults(func=cmd_web)
 
     p = sub.add_parser("doctor", help="检查环境")
     p.set_defaults(func=cmd_doctor)

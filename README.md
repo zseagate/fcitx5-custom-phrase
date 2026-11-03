@@ -8,6 +8,31 @@
 > 旧版只有 `add_phrase.sh`：一次只能加一条，拼音必须手动用 `'` 分段，五笔码必须手填，
 > 而且首次没有 `wbpy.user.dict` 时会直接失败。新版保留了对旧脚本的兼容。
 
+## 图形界面（推荐，不用终端）
+
+安装一次应用菜单项：
+
+```bash
+./install-web-launcher.sh
+```
+
+然后在应用菜单里搜索 **「Fcitx5 自定义词组」** 打开即可。
+也可以直接运行：
+
+```bash
+./fcitx5-phrase web --open
+```
+
+浏览器会打开 `http://127.0.0.1:8765/`，可以：
+
+- 添加 / 编辑 / 删除词组
+- 搜索、按拼音或五笔编码过滤
+- 批量导入（Tab / 逗号 / 空格分隔）、一键导出
+- 「应用全部」重新生成词库
+- 「退出服务」关闭后台服务
+
+> 界面只监听本机 `127.0.0.1`，并用随机 CSRF token 保护，不会暴露到局域网。
+
 ## 特性
 
 - **纯文本为源**：词组表 `~/.config/fcitx5/custom-phrase.tsv` 可读、可备份、可进 git。
@@ -83,6 +108,7 @@ ln -sf "$PWD/fcitx5-phrase" ~/.local/bin/fcitx5-phrase
 | `apply [--no-restart]` | 按词组表重建用户词库 |
 | `dump pinyin\|wbpy` | 查看当前二进制用户词库内容 |
 | `restore [pinyin\|wbpy\|all] [--list]` | 从最近备份恢复 |
+| `web [--port 8765] [--open]` | 启动图形化 Web 管理界面 |
 | `doctor` | 检查依赖、路径、码表与运行状态 |
 
 ## 词组表格式
@@ -199,6 +225,8 @@ python3 -m unittest discover -s tests -v
 主要文件：
 
 - `fcitx5-phrase`：命令行入口
-- `fcitx5_phrase.py`：全部实现
+- `fcitx5_phrase.py`：核心实现（词库 / 拼音 / 五笔 / CLI）
+- `fcitx5_phrase_web.py`：Web 界面与 HTTP 服务
 - `add_phrase.sh`：旧版兼容脚本
+- `install-web-launcher.sh`：安装应用菜单项
 - `tests/test_core.py`：单元 + 集成测试
