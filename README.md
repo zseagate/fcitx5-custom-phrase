@@ -121,7 +121,7 @@ ln -sf "$PWD/fcitx5-phrase" ~/.local/bin/fcitx5-phrase
 # 词组	拼音	五笔编码	权重
 微信	wei'xin	tmwy	100
 重庆	chong'qing	tgyd	100
-王者荣耀	wang'zhe'rong'yao	wyrl	100
+王者荣耀	wang'zhe'rong'yao	gfai	100
 ```
 
 - 拼音可写连写形式（`weixin`），工具会规范成 `wei'xin`；也可直接写 `'` 分隔形式。
